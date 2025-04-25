@@ -1,8 +1,10 @@
+import azure.functions as func
+import logging
 import re
 import json
-import azure.functions as func
-from transformers import AutoTokenizer, AutoModelForTokenClassification, pipeline
-import logging
+import urllib.request
+import os
+from typing import List, Dict
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -155,11 +157,75 @@ class CRAnonymiser:
         :param maladies: Liste des maladies rares à anonymiser.
         """
         self.maladies = LISTE_MALADIES_RARES
-        self.tokenizer = AutoTokenizer.from_pretrained("Jean-Baptiste/camembert-ner-with-dates")
-        self.model = AutoModelForTokenClassification.from_pretrained("Jean-Baptiste/camembert-ner-with-dates")
-        self.nlp = pipeline('ner', model=self.model, tokenizer=self.tokenizer, aggregation_strategy="simple")
         self.MEDICAL_PROPER_NAMES = MEDICAL_PROPER_NAMES
-
+      
+    def get_entities(self , texte):
+        data = {"inputs": texte}
+        body = str.encode(json.dumps(data))
+        url = os.environ["HG_MODEL_ENDPOINT"]
+        api_key = os.environ["HG_MODEL_ENDPOINT_KEY"]
+        if not api_key:
+            raise Exception("A key should be provided to invoke the endpoint")
+        headers = {'Content-Type':'application/json', 'Accept': 'application/json', 'Authorization':('Bearer '+ api_key)}
+        req = urllib.request.Request(url, body, headers)
+        try:
+            response = urllib.request.urlopen(req)
+            result = response.read()
+            decoded_str = result.decode('utf-8')
+            ner_list = json.loads(decoded_str)
+            logger.info(result)
+            logger.info(ner_list)
+            return ner_list
+        except urllib.error.HTTPError as error:
+            logger.info("The request failed with status code: " + str(error.code))
+            logger.info(error.info())
+            logger.info(error.read().decode("utf8", 'ignore'))
+            return []
+            
+    def reconstruct_entities(self, ner_output):
+        entities = []
+        current_entity = {
+            "entity": None,
+            "score": [],
+            "start": None,
+            "end": None,
+            "word": ""
+        }
+    
+        for token in ner_output:
+            if current_entity["entity"] != token["entity"]:
+                if current_entity["entity"]:
+                    entities.append({
+                        "entity": current_entity["entity"],
+                        "score": sum(current_entity["score"]) / len(current_entity["score"]),
+                        "word": current_entity["word"].replace("▁", " ").strip(),
+                        "start": current_entity["start"],
+                        "end": current_entity["end"]
+                    })
+                # Start new entity
+                current_entity = {
+                    "entity": token["entity"],
+                    "score": [token["score"]],
+                    "start": token["start"],
+                    "end": token["end"],
+                    "word": token["word"]
+                }
+            else:
+                current_entity["score"].append(token["score"])
+                current_entity["end"] = token["end"]
+                current_entity["word"] += token["word"]
+    
+        # Add last entity
+        if current_entity["entity"]:
+            entities.append({
+                "entity": current_entity["entity"],
+                "score": sum(current_entity["score"]) / len(current_entity["score"]),
+                "word": current_entity["word"].replace("▁", " ").strip(),
+                "start": current_entity["start"],
+                "end": current_entity["end"]
+            })
+    
+        return entities
     def check_email(self,email_adr: str) -> bool:
         """Vérifie si une adresse email est valide."""
         email_adr = email_adr.replace("%40", "@")
@@ -243,21 +309,22 @@ class CRAnonymiser:
         """Anonymise le texte."""
         text = self.remove_emails(text)
         text = self.remove_phone_numbers(text)
-        entities = self.nlp(text)
-        print(entities)
+        entities = self.get_entities(text)
+        logger.info(entities)
+        entities= self.reconstruct_entities(entities)
         medical_names_pattern = re.compile(r"\b(?:" + '|'.join(map(re.escape, self.MEDICAL_PROPER_NAMES)) + r")\b", re.IGNORECASE)
         
         person_entities = [
-            entity for entity in entities if entity['entity_group'] == 'PER' and not medical_names_pattern.search(entity['word'])
+            entity for entity in entities if entity['entity'] == 'I-PER' and not medical_names_pattern.search(entity['word'])
         ]
-        date_entities = [entity for entity in entities if entity['entity_group'] == 'DATE']
-        localisation_entities=[entity for entity in entities if entity['entity_group'] == 'LOC']
+        date_entities = [entity for entity in entities if entity['entity'] == 'I-DATE']
+        localisation_entities=[entity for entity in entities if entity['entity'] == 'I-LOC']
         all_entities = sorted(person_entities + date_entities + localisation_entities, key=lambda x: x['start'], reverse=True)
         
         for entity in all_entities:
             replacement_text = (
-    " [Personne] " if entity['entity_group'] == 'PER' 
-    else " [Localisation] " if entity['entity_group'] == 'LOC'  
+    " [Personne] " if entity['entity'] == 'I-PER' 
+    else " [Localisation] " if entity['entity'] == 'I-LOC'  
     else self.detect_entity_date_type(entity['word'])
 )
 
